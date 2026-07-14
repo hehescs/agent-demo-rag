@@ -24,17 +24,20 @@ const (
 	docsFile          = "../knowledge/docs.txt"
 )
 
+// 稠密向量维度（BGE-small-zh 是 512 维）
+const denseVectorSize = 512
+
 func main() {
-	// 1. 初始化 FastEmbed 模型
+	// 1. 初始化 FastEmbed 模型（稠密向量）
 	fmt.Println("🔧 正在加载 FastEmbed 向量模型 (BGE-small-zh)...")
-	model, err := fastembed.NewFlagEmbedding(&fastembed.InitOptions{
+	denseModel, err := fastembed.NewFlagEmbedding(&fastembed.InitOptions{
 		Model:    fastembed.BGESmallZH,
 		CacheDir: fastembedCacheDir,
 	})
 	if err != nil {
 		log.Fatal("初始化模型失败: ", err)
 	}
-	defer model.Destroy()
+	defer denseModel.Destroy()
 	fmt.Println("✅ 模型加载完成 (512维)")
 
 	// 2. 读取文档（自动处理GBK编码）
@@ -66,24 +69,108 @@ func main() {
 	}
 	fmt.Printf("📄 读取到 %d 条文档\n", len(documents))
 
-	// 3. 生成向量（PassageEmbed 用于文档入库，会自动加 "passage: " 前缀）
-	fmt.Println("🔄 正在生成向量...")
-	embeddings, err := model.PassageEmbed(documents, len(documents))
-	if err != nil {
-		log.Fatal("生成向量失败: ", err)
+	// ===== 修改点1: 创建集合时支持混合搜索 =====
+	if err := createHybridCollection(); err != nil {
+		log.Fatal("创建集合失败: ", err)
 	}
-	fmt.Printf("✅ 已生成 %d 个向量 (维度: %d)\n", len(embeddings), len(embeddings[0]))
 
-	// 4. 写入 Qdrant
-	if err := upsertToQdrant(documents, embeddings); err != nil {
+	// 3. 生成稠密向量
+	const embedBatchSize = 32
+	fmt.Println("🔄 正在生成稠密向量...")
+	var allDenseEmbeddings [][]float32
+	for i := 0; i < len(documents); i += embedBatchSize {
+		end := min(i+embedBatchSize, len(documents))
+		batch := documents[i:end]
+		batchEmb, err := denseModel.PassageEmbed(batch, len(batch))
+		if err != nil {
+			log.Printf("⚠️  批次 [%d-%d) 生成向量失败，逐条重试...", i, end)
+			for j, doc := range batch {
+				emb, err2 := denseModel.PassageEmbed([]string{doc}, 1)
+				if err2 != nil {
+					log.Printf("⚠️  文档 %d 编码失败，跳过: %v", i+j, err2)
+					allDenseEmbeddings = append(allDenseEmbeddings, nil)
+					continue
+				}
+				allDenseEmbeddings = append(allDenseEmbeddings, emb...)
+			}
+			continue
+		}
+		allDenseEmbeddings = append(allDenseEmbeddings, batchEmb...)
+		fmt.Printf("  已生成 %d/%d 条稠密向量\n", len(allDenseEmbeddings), len(documents))
+	}
+	fmt.Printf("✅ 已生成 %d 个稠密向量\n", len(allDenseEmbeddings))
+
+	// ===== 修改点2: 写入时同时存储稠密和稀疏向量 =====
+	if err := upsertHybridToQdrant(documents, allDenseEmbeddings); err != nil {
 		log.Fatal("写入 Qdrant 失败: ", err)
 	}
-	fmt.Printf("🎉 成功将 %d 条文档写入 Qdrant (集合: %s)\n", len(documents), qdrantCollection)
+	fmt.Printf("🎉 成功将文档写入 Qdrant (集合: %s)\n", qdrantCollection)
+
+	// ===== 修改点3: 测试混合搜索 =====
+	fmt.Println("\n🔍 测试混合搜索...")
+	if err := hybridSearch("洗地机"); err != nil {
+		log.Printf("搜索失败: %v", err)
+	}
 }
 
-// upsertToQdrant 将文档和对应向量写入 Qdrant
-func upsertToQdrant(documents []string, embeddings [][]float32) error {
-	// 获取当前最大 ID，避免覆盖已有数据
+// ===== 新增函数1: 创建支持混合搜索的集合 =====
+func createHybridCollection() error {
+	// 1. 删除旧集合（如果存在）
+	deleteURL := fmt.Sprintf("%s/collections/%s", qdrantBaseURL, qdrantCollection)
+	req, _ := http.NewRequest("DELETE", deleteURL, nil)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, _ := client.Do(req)
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	// 2. 创建新集合（支持稠密+稀疏向量）
+	createBody := map[string]any{
+		"vectors": map[string]any{
+			"dense": map[string]any{
+				"size":     denseVectorSize,
+				"distance": "Cosine",
+			},
+		},
+		"sparse_vectors": map[string]any{
+			"sparse": map[string]any{
+				"modifier": "idf", // 启用 IDF 加权
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(createBody)
+	if err != nil {
+		return err
+	}
+
+	createURL := fmt.Sprintf("%s/collections/%s", qdrantBaseURL, qdrantCollection)
+	req, err = http.NewRequest("PUT", createURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("创建集合失败: %s\n%s", resp.Status, string(body))
+	}
+
+	fmt.Println("✅ 集合已创建（支持密集+稀疏向量）")
+	return nil
+}
+
+// ===== 修改函数2: 混合写入 =====
+// 原来: upsertToQdrant
+// 现在: upsertHybridToQdrant
+func upsertHybridToQdrant(documents []string, denseEmbeddings [][]float32) error {
+	// 获取当前最大 ID
 	startID, err := getMaxID()
 	if err != nil {
 		fmt.Printf("⚠️  获取最大ID失败，从1开始: %v\n", err)
@@ -91,23 +178,51 @@ func upsertToQdrant(documents []string, embeddings [][]float32) error {
 	}
 
 	type Point struct {
-		ID      int            `json:"id"`
-		Vector  []float32      `json:"vector"`
-		Payload map[string]any `json:"payload"`
+		ID      int                    `json:"id"`
+		Vector  map[string]interface{} `json:"vector"` // 改为 map，支持多个向量
+		Payload map[string]any         `json:"payload"`
 	}
 
 	var points []Point
+	idCounter := 0
 	for i, doc := range documents {
-		points = append(points, Point{
-			ID:     startID + i + 1,
-			Vector: embeddings[i],
-			Payload: map[string]any{
-				"text":     doc,
-				"id":       startID + i + 1,
-				"category": "default",
-				"source":   docsFile,
+		if denseEmbeddings[i] == nil {
+			log.Printf("警告: 文档 %d 稠密向量为空，跳过\n", i)
+			continue
+		}
+
+		parts := strings.Split(doc, " ") // 注意：你的数据是用 Tab 分隔的，不是空格！
+		if len(parts) < 4 {
+			log.Printf("警告: 文档 %d 格式错误，跳过\n", i)
+			continue
+		}
+
+		idCounter++
+		pointID := startID + idCounter
+
+		// ===== 关键修改：构建包含两个向量的 Vector =====
+		// 1. 稠密向量：直接用生成的向量
+		// 2. 稀疏向量：使用 Document 结构，让 Qdrant 服务端用 BM25 生成
+		point := Point{
+			ID: pointID,
+			Vector: map[string]interface{}{
+				"dense": denseEmbeddings[i], // 稠密向量
+				"sparse": map[string]string{ // 稀疏向量：Qdrant 服务端生成
+					"text":  doc,
+					"model": "qdrant/bm25",
+				},
 			},
-		})
+			Payload: map[string]any{
+				"text":       doc,
+				"id":         pointID,
+				"name":       parts[0],
+				"price":      parts[1],
+				"category":   parts[2],
+				"source":     docsFile,
+				"sell_point": parts[3],
+			},
+		}
+		points = append(points, point)
 	}
 
 	reqBody := map[string]any{
@@ -127,7 +242,7 @@ func upsertToQdrant(documents []string, embeddings [][]float32) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -139,19 +254,114 @@ func upsertToQdrant(documents []string, embeddings [][]float32) error {
 		return fmt.Errorf("Qdrant API错误: %s\n%s", resp.Status, string(body))
 	}
 
+	fmt.Printf("✅ 成功写入 %d 条混合向量数据\n", len(points))
 	return nil
 }
 
+// ===== 新增函数3: 混合搜索 =====
+func hybridSearch(queryText string) error {
+	// 1. 加载模型生成查询的稠密向量
+	denseModel, err := fastembed.NewFlagEmbedding(&fastembed.InitOptions{
+		Model:    fastembed.BGESmallZH,
+		CacheDir: fastembedCacheDir,
+	})
+	if err != nil {
+		return err
+	}
+	defer denseModel.Destroy()
+
+	// 2. 生成查询的稠密向量（QueryEmbed）
+	queryDenseVec, err := denseModel.QueryEmbed(queryText)
+	if err != nil {
+		return err
+	}
+
+	// 3. 构建混合搜索请求
+	searchBody := map[string]any{
+		"prefetch": []map[string]any{
+			{
+				"query": queryDenseVec[0],
+				"using": "dense",
+				"limit": 20,
+			},
+			{
+				"query": map[string]string{
+					"text":  queryText,
+					"model": "qdrant/bm25",
+				},
+				"using": "sparse",
+				"limit": 20,
+			},
+		},
+		"query": map[string]string{
+			"fusion": "rrf", // 倒数排名融合
+		},
+		"limit":        10,
+		"with_payload": true,
+		"with_vector":  false,
+	}
+
+	jsonData, err := json.Marshal(searchBody)
+	if err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("%s/collections/%s/points/query", qdrantBaseURL, qdrantCollection)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("搜索失败: %s\n%s", resp.Status, string(body))
+	}
+
+	// 4. 解析结果
+	var result struct {
+		Result struct {
+			Points []struct {
+				ID      int            `json:"id"`
+				Score   float64        `json:"score"`
+				Payload map[string]any `json:"payload"`
+			} `json:"points"`
+		} `json:"result"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	fmt.Printf("\n🔍 搜索结果: %d 条\n", len(result.Result.Points))
+	for i, point := range result.Result.Points {
+		name, _ := point.Payload["name"].(string)
+		price, _ := point.Payload["price"].(string)
+		fmt.Printf("%d. ID: %d, 相似度: %.4f\n", i+1, point.ID, point.Score)
+		fmt.Printf("   名称: %s\n", name)
+		fmt.Printf("   价格: %s\n", price)
+		fmt.Printf("   类目: %v\n\n", point.Payload["category"])
+	}
+
+	return nil
+}
+
+// ===== 以下是原有的辅助函数（保持不变）=====
+
 // getMaxID 查询集合中当前最大的 point ID
-// 通过滚动遍历所有点来找到最大ID
 func getMaxID() (int, error) {
 	url := fmt.Sprintf("%s/collections/%s/points/scroll", qdrantBaseURL, qdrantCollection)
 	maxID := 0
-	limit := 100 // 每次获取100个点
+	limit := 100
 
 	client := &http.Client{Timeout: 30 * time.Second}
-
-	// 首次请求不带 offset，后续使用上一次返回的 next_offset 作为游标
 	var nextOffset interface{}
 
 	for {
@@ -160,7 +370,6 @@ func getMaxID() (int, error) {
 			"with_payload": false,
 			"with_vector":  false,
 		}
-		// 只有非首次请求才带 offset（Qdrant scroll 的 offset 是点 ID 游标，不是数字偏移）
 		if nextOffset != nil {
 			reqBody["offset"] = nextOffset
 		}
@@ -183,7 +392,6 @@ func getMaxID() (int, error) {
 
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			// 如果是集合不存在（404），返回0
 			if resp.StatusCode == http.StatusNotFound {
 				return 0, nil
 			}
@@ -191,7 +399,6 @@ func getMaxID() (int, error) {
 			return 0, fmt.Errorf("Qdrant API错误: %s, body: %s", resp.Status, string(body))
 		}
 
-		// 使用 json.RawMessage 接收 ID 和 next_offset，兼容 int / string(UUID) 两种类型
 		var result struct {
 			Result struct {
 				Points []struct {
@@ -203,24 +410,19 @@ func getMaxID() (int, error) {
 
 		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
 		resp.Body.Close()
-
 		if decodeErr != nil {
 			return 0, decodeErr
 		}
 
-		// 遍历当前批次的所有点，解析 ID 并找到最大值
 		for _, point := range result.Result.Points {
 			if id := parseIntID(point.ID); id > maxID {
 				maxID = id
 			}
 		}
 
-		// 没有更多点则退出
 		if result.Result.NextOffset == nil || len(result.Result.Points) < limit {
 			break
 		}
-
-		// 将 next_offset 原样保留作为下次请求的游标（可能是 int 或 string）
 		nextOffset = result.Result.NextOffset
 	}
 
@@ -234,17 +436,20 @@ func getMaxID() (int, error) {
 }
 
 // parseIntID 从 json.RawMessage 中解析出整数 ID
-// 兼容 Qdrant 返回 int 或 string(UUID) 两种格式
 func parseIntID(raw json.RawMessage) int {
 	if raw == nil {
 		return 0
 	}
-	// 尝试直接解析为 int
 	var intVal int
 	if err := json.Unmarshal(raw, &intVal); err == nil {
 		return intVal
 	}
-	// 尝试解析为 string（UUID 格式），取哈希值或忽略
-	// UUID 无法转为有意义的递增整数，此时返回 0 表示无法比较
 	return 0
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
