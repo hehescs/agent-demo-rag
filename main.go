@@ -186,7 +186,7 @@ type OllamaClient struct {
 func NewOllamaClient(baseURL string) *OllamaClient {
 	return &OllamaClient{
 		baseURL: baseURL,
-		httpCli: &http.Client{Timeout: 120 * time.Second},
+		httpCli: &http.Client{Timeout: 0}, // 流式响应不设超时，由模型生成速度决定
 	}
 }
 
