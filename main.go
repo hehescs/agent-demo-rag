@@ -7,119 +7,53 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anush008/fastembed-go"
 )
 
-// ============ 向量存储（内存版） ============
-type VectorStore struct {
-	mu         sync.RWMutex
-	documents  []Document
-	maxResults int
+// ============ 配置 ============
+const (
+	ollamaBaseURL     = "http://127.0.0.1:11434"
+	qdrantBaseURL     = "http://localhost:6333"
+	qdrantCollection  = "doc" // Qdrant 集合名称，按实际修改
+	chatModel         = "qwen3:8b"
+	fastembedCacheDir = "vector_store/local_cache"
+)
+
+// ============ Qdrant客户端 ============
+type QdrantClient struct {
+	baseURL    string
+	collection string
+	httpCli    *http.Client
 }
 
-type Document struct {
-	ID        string
-	Content   string
-	Embedding []float64
+type QdrantDocument struct {
+	ID      string
+	Content string
+	Score   float64
 }
 
-func NewVectorStore() *VectorStore {
-	return &VectorStore{
-		documents:  []Document{},
-		maxResults: 3,
-	}
-}
-
-func (vs *VectorStore) Add(id, content string, embedding []float64) {
-	vs.mu.Lock()
-	defer vs.mu.Unlock()
-	vs.documents = append(vs.documents, Document{
-		ID:        id,
-		Content:   content,
-		Embedding: embedding,
-	})
-}
-
-func (vs *VectorStore) Search(queryEmbedding []float64, topK int) []Document {
-	vs.mu.RLock()
-	defer vs.mu.RUnlock()
-
-	if len(vs.documents) == 0 {
-		return []Document{}
-	}
-
-	type result struct {
-		doc   Document
-		score float64
-	}
-
-	var results []result
-	for _, doc := range vs.documents {
-		score := cosineSimilarity(queryEmbedding, doc.Embedding)
-		results = append(results, result{doc, score})
-	}
-
-	// 按相似度排序
-	for i := 0; i < len(results); i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[j].score > results[i].score {
-				results[i], results[j] = results[j], results[i]
-			}
-		}
-	}
-
-	if len(results) > topK {
-		results = results[:topK]
-	}
-
-	var docs []Document
-	for _, r := range results {
-		docs = append(docs, r.doc)
-	}
-	return docs
-}
-
-func cosineSimilarity(a, b []float64) float64 {
-	if len(a) != len(b) || len(a) == 0 {
-		return 0
-	}
-	var dot, normA, normB float64
-	for i := 0; i < len(a); i++ {
-		dot += a[i] * b[i]
-		normA += a[i] * a[i]
-		normB += b[i] * b[i]
-	}
-	if normA == 0 || normB == 0 {
-		return 0
-	}
-	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
-}
-
-// ============ Ollama客户端（使用HTTP） ============
-type OllamaClient struct {
-	baseURL string
-	httpCli *http.Client
-}
-
-func NewOllamaClient(baseURL string) *OllamaClient {
-	return &OllamaClient{
-		baseURL: baseURL,
-		httpCli: &http.Client{Timeout: 120 * time.Second},
+func NewQdrantClient(baseURL, collection string) *QdrantClient {
+	return &QdrantClient{
+		baseURL:    baseURL,
+		collection: collection,
+		httpCli:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
-// 获取嵌入向量
-func (c *OllamaClient) Embeddings(ctx context.Context, model, text string) ([]float64, error) {
-	url := c.baseURL + "/api/embed"
+// Search 在Qdrant中搜索最相似的文档
+func (q *QdrantClient) Search(ctx context.Context, vector []float64, limit int) ([]QdrantDocument, error) {
+	url := fmt.Sprintf("%s/collections/%s/points/search", q.baseURL, q.collection)
 
-	reqBody := map[string]interface{}{
-		"model":  model,
-		"prompt": text,
+	reqBody := map[string]any{
+		"vector":       vector,
+		"limit":        limit,
+		"with_payload": true,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -133,7 +67,7 @@ func (c *OllamaClient) Embeddings(ctx context.Context, model, text string) ([]fl
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpCli.Do(req)
+	resp, err := q.httpCli.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -141,24 +75,51 @@ func (c *OllamaClient) Embeddings(ctx context.Context, model, text string) ([]fl
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Ollama API错误: %s, body: %s", resp.Status, string(body))
+		return nil, fmt.Errorf("Qdrant API错误: %s, body: %s", resp.Status, string(body))
 	}
 
 	var result struct {
-		Embedding []float64 `json:"embedding"`
+		Result []struct {
+			ID      json.RawMessage `json:"id"`
+			Payload map[string]any  `json:"payload"`
+			Score   float64         `json:"score"`
+		} `json:"result"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
 
-	return result.Embedding, nil
+	var docs []QdrantDocument
+	for _, r := range result.Result {
+		content, _ := r.Payload["text"].(string)
+		idStr := strings.Trim(string(r.ID), `"`)
+		docs = append(docs, QdrantDocument{
+			ID:      idStr,
+			Content: content,
+			Score:   r.Score,
+		})
+	}
+	return docs, nil
+}
+
+// ============ Ollama客户端（仅流式对话） ============
+type OllamaClient struct {
+	baseURL string
+	httpCli *http.Client
+}
+
+func NewOllamaClient(baseURL string) *OllamaClient {
+	return &OllamaClient{
+		baseURL: baseURL,
+		httpCli: &http.Client{Timeout: 120 * time.Second},
+	}
 }
 
 // 流式对话
 func (c *OllamaClient) ChatStream(ctx context.Context, model string, messages []Message, onChunk func(string)) error {
 	url := c.baseURL + "/api/chat"
 
-	reqBody := map[string]interface{}{
+	reqBody := map[string]any{
 		"model":    model,
 		"messages": messages,
 		"stream":   true,
@@ -225,45 +186,39 @@ type Message struct {
 
 // ============ RAG系统 ============
 type RAGSystem struct {
-	ollama      *OllamaClient
-	vectorStore *VectorStore
-	modelName   string
+	ollama    *OllamaClient
+	fastembed *fastembed.FlagEmbedding
+	qdrant    *QdrantClient
+	modelName string
 }
 
-func NewRAGSystem(ollama *OllamaClient, modelName string) *RAGSystem {
+func NewRAGSystem(ollama *OllamaClient, fastembedModel *fastembed.FlagEmbedding, qdrant *QdrantClient, modelName string) *RAGSystem {
 	return &RAGSystem{
-		ollama:      ollama,
-		vectorStore: NewVectorStore(),
-		modelName:   modelName,
+		ollama:    ollama,
+		fastembed: fastembedModel,
+		qdrant:    qdrant,
+		modelName: modelName,
 	}
-}
-
-func (r *RAGSystem) PrepareKnowledgeBase(ctx context.Context, docs []string) error {
-	fmt.Println("📚 正在准备知识库...")
-
-	for i, doc := range docs {
-		embedding, err := r.ollama.Embeddings(ctx, r.modelName, doc)
-		if err != nil {
-			return fmt.Errorf("生成文档 %d 向量失败: %w", i, err)
-		}
-
-		r.vectorStore.Add(fmt.Sprintf("doc_%d", i), doc, embedding)
-		fmt.Printf("  ✅ 文档 %d 已加载 (向量维度: %d)\n", i+1, len(embedding))
-	}
-
-	fmt.Printf("📚 知识库准备完成，共 %d 个文档\n", len(docs))
-	return nil
 }
 
 func (r *RAGSystem) Ask(ctx context.Context, question string, onChunk func(string)) (string, error) {
-	// Step 1: 生成问题向量
-	questionEmbedding, err := r.ollama.Embeddings(ctx, r.modelName, question)
+	// Step 1: 用fastembed生成问题向量
+	queryVector, err := r.fastembed.QueryEmbed(question)
 	if err != nil {
 		return "", fmt.Errorf("生成问题向量失败: %w", err)
 	}
 
-	// Step 2: 搜索相关文档
-	relevantDocs := r.vectorStore.Search(questionEmbedding, 3)
+	// 将float32转为float64（Qdrant需要float64）
+	vectorF64 := make([]float64, len(queryVector))
+	for i, v := range queryVector {
+		vectorF64[i] = float64(v)
+	}
+
+	// Step 2: 在Qdrant中搜索相关文档
+	relevantDocs, err := r.qdrant.Search(ctx, vectorF64, 3)
+	if err != nil {
+		return "", fmt.Errorf("搜索知识库失败: %w", err)
+	}
 
 	if len(relevantDocs) == 0 {
 		return "知识库中没有找到相关信息。", nil
@@ -271,13 +226,13 @@ func (r *RAGSystem) Ask(ctx context.Context, question string, onChunk func(strin
 
 	// Step 3: 构建上下文
 	var contextBuilder strings.Builder
-	contextBuilder.WriteString("请基于以下资料回答用户问题。如果资料中没有相关信息，请明确说明。\n\n")
+	contextBuilder.WriteString("请基于以下资料回答用户问题。匹配度高的话不要质疑资料的内容。如果资料中没有相关信息，请明确说明。\n\n")
 
 	for i, doc := range relevantDocs {
-		contextBuilder.WriteString(fmt.Sprintf("【资料 %d】\n%s\n\n", i+1, doc.Content))
+		fmt.Fprintf(&contextBuilder, "【资料 %d】(相似度: %.4f)\n%s\n\n", i+1, doc.Score, doc.Content)
 	}
 
-	contextBuilder.WriteString(fmt.Sprintf("用户问题：%s\n\n", question))
+	fmt.Fprintf(&contextBuilder, "用户问题：%s\n\n", question)
 	contextBuilder.WriteString("回答（请用通俗易懂的语言，基于以上资料）：")
 
 	// Step 4: 调用Ollama流式输出
@@ -339,7 +294,8 @@ func (ui *InteractiveUI) handleUserInput() {
 
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Println("🤖 RAG 增强搜索系统")
-	fmt.Println("📚 模型: qwen3:8b")
+	fmt.Printf("📚 对话模型: %s | 向量模型: fastembed (BGE-small-zh)\n", chatModel)
+	fmt.Printf("🗄️  向量数据库: Qdrant @ %s (集合: %s)\n", qdrantBaseURL, qdrantCollection)
 	fmt.Println("💡 提示: 输入问题开始搜索，按 Ctrl+C 中断回答")
 	fmt.Println("📝 输入 'exit' 或 'quit' 退出")
 	fmt.Println(strings.Repeat("=", 60))
@@ -417,7 +373,7 @@ func (ui *InteractiveUI) handleUserInput() {
 					close(stopAnimation)
 					<-stopAnimation
 				}
-				fmt.Println("\n")
+				fmt.Println()
 
 			case err := <-errChan:
 				if err == context.Canceled {
@@ -445,59 +401,64 @@ func (ui *InteractiveUI) handleUserInput() {
 		ui.isGenerating = false
 		ui.mu.Unlock()
 	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "\n❌ 读取输入错误: %v\n", err)
+	}
 }
 
 // ============ 主函数 ============
 func main() {
 	// 检查Ollama是否运行
-	if err := checkOllama(); err != nil {
+	if err := checkService(ollamaBaseURL, "Ollama"); err != nil {
 		fmt.Printf("❌ Ollama未运行: %v\n", err)
 		fmt.Println("请先启动: ollama serve")
 		os.Exit(1)
 	}
 
-	// 创建Ollama客户端
-	ollama := NewOllamaClient("http://127.0.0.1:11434")
-
-	// 创建RAG系统
-	rag := NewRAGSystem(ollama, "qwen3:8b")
-	ctx := context.Background()
-
-	// // 准备知识库
-	// knowledgeBase := []string{
-	// 	"Go语言是由Google开发的静态强类型、编译型、并发型编程语言，具有垃圾回收功能。",
-	// 	"goroutine是Go语言中的轻量级线程，由Go运行时管理。它比操作系统线程更轻量，创建成本很低，可以同时运行成千上万个。",
-	// 	"Go语言支持垃圾回收（GC），自动管理内存分配和释放，开发者不需要手动管理内存。",
-	// 	"Go的并发模型基于CSP（Communicating Sequential Processes）理论，通过goroutine和channel实现并发编程。",
-	// 	"Go语言的设计目标是提供一种简单、高效、可靠的编程语言，特别适合构建大规模分布式系统。",
-	// 	"Go语言的编译速度非常快，可以快速将代码编译成单一的可执行文件，便于部署。",
-	// 	"Go标准库提供了丰富的网络编程支持，包括HTTP服务器、客户端、WebSocket等。",
-	// 	"Go的包管理工具go mod支持模块化开发，可以方便地管理项目依赖。",
-	// 	"Go语言中通过关键字go来启动一个goroutine，例如：go func() { fmt.Println('hello') }()。",
-	// 	"Go的channel是goroutine之间通信的主要方式，可以分为有缓冲和无缓冲两种类型。",
-	// }
-
-	// 准备知识库
-	knowledgeBase := []string{
-		"猫喜欢看瑞克和莫蒂的动画片。",
-	}
-
-	if err := rag.PrepareKnowledgeBase(ctx, knowledgeBase); err != nil {
-		fmt.Printf("❌ 准备知识库失败: %v\n", err)
+	// 检查Qdrant是否运行
+	if err := checkService(qdrantBaseURL, "Qdrant"); err != nil {
+		fmt.Printf("❌ Qdrant未运行: %v\n", err)
+		fmt.Println("请先启动Qdrant向量数据库")
 		os.Exit(1)
 	}
+
+	// 创建Ollama客户端（仅用于流式对话）
+	ollama := NewOllamaClient(ollamaBaseURL)
+
+	// 初始化FastEmbed本地向量模型
+	fmt.Println("🔧 正在加载FastEmbed向量模型 (BGE-small-zh)...")
+	embedModel, err := fastembed.NewFlagEmbedding(&fastembed.InitOptions{
+		Model:    fastembed.BGESmallZH, // 使用中文模型，向量维度通常是 512 维
+		CacheDir: fastembedCacheDir,
+	})
+	if err != nil {
+		fmt.Printf("❌ 初始化FastEmbed失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer embedModel.Destroy()
+	fmt.Println("✅ FastEmbed向量模型加载完成 (512维)")
+
+	// 创建Qdrant客户端
+	qdrant := NewQdrantClient(qdrantBaseURL, qdrantCollection)
+
+	// 创建RAG系统
+	rag := NewRAGSystem(ollama, embedModel, qdrant, chatModel)
 
 	// 启动交互界面
 	ui := NewInteractiveUI(rag)
 	ui.handleUserInput()
 }
 
-// 检查Ollama是否运行
-func checkOllama() error {
-	resp, err := http.Get("http://127.0.0.1:11434/api/tags")
+// 检查服务是否运行
+func checkService(baseURL, name string) error {
+	resp, err := http.Get(baseURL)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("%s 返回状态码: %d", name, resp.StatusCode)
+	}
 	return nil
 }
